@@ -34,6 +34,8 @@
 #include "prx/libkernel/File/include/DescriptorControl.hpp"
 #include "prx/libc/include/CreationMask.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
+#include "prx/libkernel/File/include/SharedMemory.hpp"
+#include "prx/libkernel/Equeue/Equeue.hpp"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -74,6 +76,7 @@ constexpr int GuestEinval = 22;
 constexpr int GuestEexist = 17;
 constexpr int GuestExdev = 18;
 constexpr int GuestEdeadlk = 11;
+constexpr int GuestEopnotsupp = 45;
 constexpr int GuestEagain = 35;
 constexpr int GuestEloop = 62;
 constexpr int GuestEnametoolong = 63;
@@ -525,6 +528,7 @@ std::int64_t APS5_VABI _fpathconf_nid_postfix(int fd, int name) {
 #endif
     if (name == PcAsyncIo) return PosixAsynchronousIo;
     if (withoutVnode) return name == PcPipeBuf ? 512 : Fail(GuestEinval);
+    if (IsKqueueDescriptor_nid_no_patch(fd) || File::IsSharedMemoryDescriptor_nid_no_patch(fd)) return Fail(GuestEopnotsupp);
     return PathConfigurationValue(name);
 }
 
@@ -681,6 +685,24 @@ int APS5_VABI kldnext_nid_postfix(int fileid) {
 int APS5_VABI kldunload_nid_postfix(int fileid) {
     (void)fileid;
     return static_cast<int>(Fail(GuestEperm));
+}
+
+int APS5_VABI kldsym_nid_postfix(int fileid, int cmd, void* data) {
+    struct SymbolLookup {
+        std::int32_t version;
+        const char* name;
+        std::uint64_t value;
+        std::uint64_t size;
+    };
+    static_assert(sizeof(SymbolLookup) == 32);
+    constexpr int LookupCommand = 1;
+    SymbolLookup lookup{};
+    if (!GuestCopyIn_nid_no_patch(&lookup, data, sizeof(lookup))) return static_cast<int>(Fail(GuestEfault));
+    if (lookup.version != static_cast<std::int32_t>(sizeof(lookup)) || cmd != LookupCommand) return static_cast<int>(Fail(GuestEinval));
+    std::string name;
+    if (const int error = CopyGuestPath_nid_no_patch(lookup.name, name)) return static_cast<int>(Fail(error));
+    if (fileid != 0) return static_cast<int>(Fail(GuestEnoent));
+    throw std::runtime_error("kldsym: looking up the symbol " + name + " in every kernel module is not supported");
 }
 
 int APS5_VABI symlink_nid_postfix(const char* target, const char* created) {
