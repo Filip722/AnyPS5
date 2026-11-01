@@ -495,6 +495,10 @@ void verifyResultMemoBudgetMasked() {
     require(!compileResultMemoPixel(2u), "result memo budget masked: a new snapshot hit the memo");
     const auto second = ResultMemoBytes() - first;
     require(second != 0u && second < first, std::string("result memo budget masked: the masked table's entry was not counted (first result " + std::to_string(first) + " bytes, patched result " + std::to_string(second) + ")").c_str());
+    const auto recycledBefore = RecycledResults();
+    for (std::uint32_t value = 3u; value < 643u; ++value) static_cast<void>(compileResultMemoPixel(value));
+    const bool recycles = std::getenv("APS5_NO_RESULT_RECYCLE") == nullptr;
+    require((RecycledResults() > recycledBefore) == recycles, "result memo budget masked: recycled storage was not exercised as configured");
     SetResultMemoBudget(1u);
     require(ResultMemoBytes() == 0u, std::string("result memo budget masked: a trim to one byte left " + std::to_string(ResultMemoBytes()) + " bytes").c_str());
     SetResultMemoBudget(0u);
@@ -3543,6 +3547,23 @@ void verifyTableSnapshotReuse() {
     GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(paged), PagedBytes);
     const auto pagedRemapped = capture(pagedRequest, paged, PagedBytes, nullptr);
     require(pagedRemapped.reuse.unwritten == 0u && pagedRemapped.reuse.shared == 0u && pagedRemapped.reuse.columns == 1u && !sharesColumn(pagedRemapped, pagedFresh) && heldRecords(pagedRemapped, paged, PagedRecords), "table snapshot reuse: a table mapped again with new contents was not read again");
+    const auto recycledBefore = RecycledResults();
+    std::shared_ptr<const RecompileResult> heldRecycled;
+    static std::array<std::array<std::uint32_t, 4>, 640> recycledOutputs{};
+    for (auto& recycledOutput : recycledOutputs) {
+        const auto recycledV = TableV(recycledOutput.data(), 0u, static_cast<std::uint32_t>(sizeof(recycledOutput)));
+        std::copy(recycledV.begin(), recycledV.end(), guest.srt.begin() + 12);
+        const auto recycledResult = CompileTable(request);
+        if (heldRecycled == nullptr) heldRecycled = recycledResult.result;
+        const auto* recycledBuffers = TableBinding(*recycledResult.result, DescriptorRole::GuestBuffers);
+        require(recycledBuffers != nullptr && std::search(recycledBuffers->guestDescriptor.begin(), recycledBuffers->guestDescriptor.end(), recycledV.begin(), recycledV.end()) != recycledBuffers->guestDescriptor.end(), "table snapshot reuse: a patched result in recycled storage holds another buffer's descriptor");
+    }
+    const auto heldV = TableV(recycledOutputs.front().data(), 0u, static_cast<std::uint32_t>(sizeof(recycledOutputs.front())));
+    const auto* heldBuffers = TableBinding(*heldRecycled, DescriptorRole::GuestBuffers);
+    require(heldBuffers != nullptr && std::search(heldBuffers->guestDescriptor.begin(), heldBuffers->guestDescriptor.end(), heldV.begin(), heldV.end()) != heldBuffers->guestDescriptor.end(), "table snapshot reuse: an owned result was overwritten while its caller retained it");
+    std::copy(outputV.begin(), outputV.end(), guest.srt.begin() + 12);
+    const bool recycles = std::getenv("APS5_NO_MASKED_RESULT_MEMO") == nullptr && std::getenv("APS5_NO_RESULT_RECYCLE") == nullptr;
+    require((RecycledResults() > recycledBefore) == recycles, recycles ? "table snapshot reuse: no evicted result was recycled into a patched one" : "table snapshot reuse: a result was recycled with recycling off");
     std::cout << "table snapshot reuse " << (watched ? "with" : "without") << " write watching passed\n";
 }
 

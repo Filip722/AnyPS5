@@ -862,6 +862,7 @@ struct MeshOutputBudget {
 struct ResourceCapture;
 [[nodiscard]] std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit = nullptr);
 void SetResultMemoBudget(std::uint64_t bytes);
+[[nodiscard]] std::uint64_t RecycledResults();
 [[nodiscard]] std::uint64_t ResultMemoBytes();
 void SetResultMemoTrimHook(std::function<void()> hook);
 
