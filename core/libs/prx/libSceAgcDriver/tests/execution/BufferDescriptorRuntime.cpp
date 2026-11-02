@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <iostream>
 #include <span>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -167,6 +169,7 @@ void ScalarReads(AgcDriver::VulkanDevice& device) {
         {0u, 0u, false}, {0u, 7u, false}, {0u, 8u, true}, {1u, 7u, false},
         {2u, 3u, false}, {2u, 4u, true}, {4u, 0x40000000u, true}, {0x3fffu, 0xffffffffu, true},
     }};
+    request.target.exactRobustLoads = false;
     GuestAllocations::Mutation().Add(Input.data(), Input.size(), true, false, true);
     for (const auto& test : bounds) {
         auto input = BufferDescriptor(Input.data(), test.records);
@@ -174,11 +177,75 @@ void ScalarReads(AgcDriver::VulkanDevice& device) {
         std::copy(input.begin(), input.end(), userData.begin());
         Output.fill(Fill);
         const auto result = ShaderRecompiler::Recompile(request);
+        ShaderRecompiler::DescriptorValue descriptor{};
+        std::copy(input.begin(), input.end(), descriptor.dwords.begin());
+        descriptor.dwordCount = 4u;
+        const auto expectedTail = test.records == 0u ? 0u : (test.stride == 0u ? test.records : test.stride * test.records) & 3u;
+        Require(ShaderRecompiler::BufferSpecializationFields(descriptor, {}, 0u).tail == expectedTail, "scalar buffer size tail differs for stride " + std::to_string(test.stride) + " records " + std::to_string(test.records));
         device.Dispatch(result, 1, 1, 1);
         device.WaitIdle();
         const auto value = test.inBounds ? expected : 0u;
         Require(std::all_of(Output.begin(), Output.end(), [value](std::uint32_t word) { return word == value; }), "scalar buffer bounds differ for stride " + std::to_string(test.stride) + " records " + std::to_string(test.records));
     }
+    std::uint32_t unalignedExpected = 0;
+    std::memcpy(&unalignedExpected, Input.data() + 4u, sizeof(unalignedExpected));
+    for (const auto& [base, records, value] : {std::tuple{Input.data() + 2u, 6u, 0u}, std::tuple{Input.data() + 2u, 8u, unalignedExpected}, std::tuple{static_cast<std::uint8_t*>(nullptr), 8u, 0u}}) {
+        const auto input = BufferDescriptor(base, records);
+        std::copy(input.begin(), input.end(), userData.begin());
+        Output.fill(Fill);
+        const auto result = ShaderRecompiler::Recompile(request);
+        device.Dispatch(result, 1, 1, 1);
+        device.WaitIdle();
+        Require(std::all_of(Output.begin(), Output.end(), [value](std::uint32_t word) { return word == value; }), "scalar buffer read differs for base " + Hex(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(base))) + " records " + std::to_string(records) + ": " + Hex(Output[0]));
+    }
+    constexpr std::array<std::uint32_t, 6> storeCode{0x34020082u, 0x7e0402ffu, 0x12345678u, 0xe0701000u, 0x80000201u, 0xbf810000u};
+    auto oversized = BufferDescriptor(reinterpret_cast<const void*>(std::uintptr_t{0x10000000000u}), 0xffffffffu);
+    oversized[1] |= 2u << 16u;
+    std::copy(oversized.begin(), oversized.end(), userData.begin());
+    request.shader.code = storeCode;
+    request.shader.codeAddress = reinterpret_cast<std::uintptr_t>(storeCode.data());
+    const auto storeResult = ShaderRecompiler::Recompile(request);
+    device.Dispatch(storeResult, 1, 1, 1);
+    device.WaitIdle();
+    const auto null = BufferDescriptor(nullptr, 8u);
+    std::copy(null.begin(), null.end(), userData.begin());
+    request.shader.code = scalarCode;
+    request.shader.codeAddress = reinterpret_cast<std::uintptr_t>(scalarCode.data());
+    Output.fill(Fill);
+    const auto nullResult = ShaderRecompiler::Recompile(request);
+    device.Dispatch(nullResult, 1, 1, 1);
+    device.WaitIdle();
+    Require(std::all_of(Output.begin(), Output.end(), [](std::uint32_t word) { return word == 0u; }), "scalar read through a null V# after a store through an oversized V# returned " + Hex(Output[0]));
+    for (const auto tailBytes : {8u, 4u}) {
+        const auto baseOffset = InputBytes - tailBytes;
+        const auto input = BufferDescriptor(Input.data() + baseOffset, 0xffffffffu);
+        std::copy(input.begin(), input.end(), userData.begin());
+        Output.fill(Fill);
+        const auto result = ShaderRecompiler::Recompile(request);
+        device.Dispatch(result, 1, 1, 1);
+        device.WaitIdle();
+        std::uint32_t value = 0u;
+        if (tailBytes == 8u) std::memcpy(&value, Input.data() + baseOffset + 4u, sizeof(value));
+        Require(std::all_of(Output.begin(), Output.end(), [value](std::uint32_t word) { return word == value; }), "scalar buffer host tail differs for " + std::to_string(tailBytes) + " bytes");
+    }
+    request.useCache = true;
+    ShaderRecompiler::SrtRuntime runtime{};
+    runtime.userData = userData;
+    bool memoHit = false;
+    for (const auto records : {8u, 7u, 8u}) {
+        const auto input = BufferDescriptor(Input.data(), records);
+        std::copy(input.begin(), input.end(), userData.begin());
+        Output.fill(Fill);
+        const auto capture = ShaderRecompiler::CaptureResources(request, runtime);
+        const auto result = ShaderRecompiler::Recompile(request, *capture, &memoHit);
+        device.Dispatch(*result, 1, 1, 1);
+        device.WaitIdle();
+        const auto value = records == 8u ? expected : 0u;
+        Require(std::all_of(Output.begin(), Output.end(), [value](std::uint32_t word) { return word == value; }), "cached scalar buffer tail differs for " + std::to_string(records) + " bytes");
+    }
+    Require(memoHit, "cached scalar buffer tail did not reuse its 8-byte result");
+    request.useCache = false;
+    std::puts("Cached scalar 8/7/8-byte tail results and final result-memo hit passed");
     GuestAllocations::Mutation().Remove(Input.data());
 }
 
