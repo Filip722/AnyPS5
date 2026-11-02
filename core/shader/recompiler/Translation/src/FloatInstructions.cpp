@@ -653,12 +653,13 @@ bool TranslationContext::floatBinary(const RdnaInstruction& inst, IrOpcode opcod
         const RdnaOperand& operand = sourceAt(inst, reverse ? 1u - index : index);
         args[index] = readOperand(operand, IrOpcodeArgumentType(opcode, index));
     }
+    const bool noInvalidResult = (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPSub32) && (isFiniteF32Constant(*args[0]) || isFiniteF32Constant(*args[1]));
     IrValue* result = &ir.Emit(opcode, IrOpcodeType(opcode), {args[0], args[1]});
     if (opcode == IrOpcode::FPMul32) result = &flushTinyProduct(args[0], args[1], result).Value();
-    if (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32) result = nanResultF32({args[0], args[1]}, result);
+    if (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32) result = nanResultF32({args[0], args[1]}, result, nullptr, noInvalidResult);
     if (opcode == IrOpcode::FPSub32) {
         IrValue* negated = &ir.BitCastF32(ir.BitwiseXor(ir.BitCastU32(*args[1]), ir.Constant(0x80000000u)));
-        result = reverse ? nanResultF32({negated, args[0]}, result) : nanResultF32({args[0], negated}, result);
+        result = reverse ? nanResultF32({negated, args[0]}, result, nullptr, noInvalidResult) : nanResultF32({args[0], negated}, result, nullptr, noInvalidResult);
     }
     writeOperand(inst.destination, result);
     return true;

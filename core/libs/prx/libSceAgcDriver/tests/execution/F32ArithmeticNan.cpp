@@ -1,6 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
+#include "ControlFlow/GraphBuilder.hpp"
+#include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include "Translation/InstructionTranslator.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
@@ -185,7 +188,50 @@ bool IsNan16(std::uint32_t value) {
     return (value & 0x7fffu) > 0x7c00u;
 }
 
-void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::ShaderFloatMode>& floatMode) {
+std::uint32_t LiteralExpected(std::uint32_t lhs, std::uint32_t rhs, std::uint32_t operation, bool ieee) {
+    const auto flush = [](std::uint32_t bits) { return (bits & 0x7f800000u) == 0u ? bits & 0x80000000u : bits; };
+    lhs = flush(lhs);
+    rhs = flush(rhs);
+    if (IsNan32(lhs)) return (lhs ^ (operation == 2u ? 0x80000000u : 0u)) | (ieee ? 0x00400000u : 0u);
+    if (IsNan32(rhs)) return (rhs ^ (operation == 1u ? 0x80000000u : 0u)) | (ieee ? 0x00400000u : 0u);
+    const float a = std::bit_cast<float>(lhs);
+    const float b = std::bit_cast<float>(rhs);
+    const float value = operation == 0u ? a + b : operation == 1u ? a - b : b - a;
+    const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+    return IsNan32(bits) ? 0xffc00000u : flush(bits);
+}
+
+void CheckLiteralRepairElision() {
+    using namespace ShaderRecompiler;
+    for (const auto opcode : {0x060002ffu, 0x080002ffu, 0x0a0002ffu}) {
+        for (const auto literal : {0u, 1u, 0x00800000u, 0x3f800000u, 0x7f7fffffu, 0x7f800000u, 0x7f812345u}) {
+            const std::array<std::uint32_t, 3> code{opcode, literal, 0xbf810000u};
+            auto decoded = RdnaInstructionDecoder{}.Decode(code);
+            Require(decoded.instructions.size() == 2u && decoded.instructions[0].wordCount == 2u && decoded.instructions[1].programCounter == 8u, "f32 literal arithmetic instruction alignment");
+            decoded.instructions[0].source0.absolute = true;
+            decoded.instructions[0].source0.negate = true;
+            const auto graph = GraphBuilder{}.Build(decoded);
+            const ShaderComputeInputInfo compute{};
+            TranslateOptions options{};
+            options.stage = ShaderStageKind::Compute;
+            options.waveSize = 32u;
+            options.floatMode = ShaderFloatMode{literal == 1u ? 0xf0u : 0xc0u, true, true, false};
+            options.float32DenormPreserve = true;
+            options.inputInfo.compute = &compute;
+            const auto program = InstructionTranslator{}.Translate(decoded, graph, options);
+            std::uint32_t repairs = 0u;
+            for (const auto& block : program.Blocks()) {
+                for (const auto* value : block->Instructions()) {
+                    if (value->Opcode() == IrOpcode::SelectU32 && value->Argument(1)->HasImmediate() && value->Argument(1)->ImmediateU32() == 0xffc00000u) ++repairs;
+                }
+            }
+            const std::uint32_t expected = ExactF32Arithmetic() && (literal & 0x7f800000u) == 0x7f800000u ? 1u : 0u;
+            Require(repairs == expected, "f32 literal arithmetic invalid-result repair classification");
+        }
+    }
+}
+
+void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::ShaderFloatMode>& floatMode, std::optional<std::uint32_t> literal = std::nullopt) {
     for (std::uint32_t tid = 0; tid < Threads; ++tid) Fill(tid, &Input[tid * Inputs]);
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(8, 0u);
@@ -193,7 +239,16 @@ void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::
     const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
     std::copy(input.begin(), input.end(), userData.begin());
     std::copy(output.begin(), output.end(), userData.begin() + 4);
-    const std::span<const std::uint32_t> code(Code);
+    std::vector<std::uint32_t> words;
+    for (std::uint32_t index = 0u; index < Code.size(); ++index) {
+        if (literal && index >= 21u && index < 24u) {
+            words.push_back((Code[index] & ~0x1ffu) | 0xffu);
+            words.push_back(*literal);
+        } else {
+            words.push_back(Code[index]);
+        }
+    }
+    const std::span<const std::uint32_t> code(words);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
@@ -210,12 +265,12 @@ void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::
     device.WaitIdle();
 }
 
-void Check(const std::uint32_t (&expected)[32][16], const char* mode) {
+void Check(const std::uint32_t (&expected)[32][16], const char* mode, std::optional<std::uint32_t> literal = std::nullopt, bool ieee = false) {
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
         const std::uint32_t* out = &Output[tid * Results];
         for (std::uint32_t i = 0; i < 16; ++i) {
             const std::string name = std::string(mode) + " " + Names[i];
-            Expect(tid, out[i], expected[tid][i], name.c_str());
+            Expect(tid, out[i], literal && i < 3u ? LiteralExpected(*literal, Rows[tid][1], i, ieee) : expected[tid][i], name.c_str());
         }
     }
 }
@@ -224,6 +279,7 @@ void Check(const std::uint32_t (&expected)[32][16], const char* mode) {
 
 int main() {
     try {
+        CheckLiteralRepairElision();
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         for (const bool fused : {false, true}) {
@@ -235,6 +291,13 @@ int main() {
             Check(ExpectedNoIeee, "IEEE=0");
             Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, true, false});
             Check(ExpectedIeee, "IEEE=1");
+            if (!ShaderRecompiler::ExactF32Arithmetic()) continue;
+            for (const auto literal : {0u, 1u, 0x3f800000u, 0x7f800000u, 0x7f812345u}) {
+                Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false}, literal);
+                Check(ExpectedNoIeee, "literal IEEE=0", literal);
+                Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, true, false}, literal);
+                Check(ExpectedIeee, "literal IEEE=1", literal, true);
+            }
         }
         std::puts("f32 arithmetic nan tests passed");
         return 0;
