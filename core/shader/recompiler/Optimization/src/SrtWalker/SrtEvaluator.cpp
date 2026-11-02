@@ -340,6 +340,7 @@ std::optional<std::size_t> evaluatedArguments(IrOpcode opcode) {
         case IrOpcode::SelectU1:
         case IrOpcode::SelectF32: return 3u;
         case IrOpcode::BitFieldInsert: return 4u;
+        case IrOpcode::NanPropagateF32: return 6u;
         default: return std::nullopt;
     }
 }
@@ -368,6 +369,7 @@ std::optional<bool> evaluableAlone(const IrResourcePlan& program, const IrValue&
         case IrOpcode::LoadAddressU32:
         case IrOpcode::ReadConstBuffer: return IsRawRead(program, value);
         case IrOpcode::Phi: return std::nullopt;
+        case IrOpcode::NanPropagateF32: return value.ArgumentCount() < 6u ? std::optional(false) : std::nullopt;
         case IrOpcode::CompositeExtractU32x4: {
             const auto* source = value.ArgumentCount() == 2u && value.Argument(0) != nullptr ? value.Argument(0)->Resolve() : nullptr;
             const auto* index = value.ArgumentCount() == 2u && value.Argument(1) != nullptr ? value.Argument(1)->Resolve() : nullptr;
@@ -687,6 +689,26 @@ bool BasicEvaluator<TNode>::EvaluateInst(const TNode& inst, std::uint64_t& resul
                 return true;
             }
             return false;
+        case IrOpcode::NanPropagateF32: {
+            std::array<std::uint64_t, 6> values{};
+            if (inst.ArgumentCount() < values.size()) return false;
+            for (std::size_t index = 0; index < values.size(); ++index) {
+                if (!Arg(inst, index, values[index])) return false;
+            }
+            const auto isNan = [](std::uint32_t bits) { return (bits & 0x7fffffffu) > 0x7f800000u; };
+            const auto flags = static_cast<std::uint32_t>(values[1]);
+            const bool quiet = (flags & 1u) != 0u;
+            const auto count = std::min<std::uint32_t>(flags >> 1u, 3u);
+            auto bits = static_cast<std::uint32_t>(values[0]);
+            if (isNan(bits)) bits = 0xffc00000u;
+            for (auto index = count; index-- > 0u;) {
+                const auto source = static_cast<std::uint32_t>(values[3u + index]);
+                const bool invalid = index == 2u && count == 3u && values[2] != 0u;
+                if (isNan(source) && !invalid) bits = quiet ? source | 0x400000u : source;
+            }
+            result = bits;
+            return true;
+        }
         case IrOpcode::FPTrunc32:
             if (Arg(inst, 0, a)) {
                 result = Float32Bits(std::trunc(Float32(a)));
