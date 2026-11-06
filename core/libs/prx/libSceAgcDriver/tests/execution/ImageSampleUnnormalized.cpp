@@ -7,6 +7,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <iostream>
 #include <span>
@@ -67,6 +68,17 @@ alignas(256) constexpr std::array<std::uint32_t, 45> OffsetCode{
     0xe0701028, 0x80000e01, 0xe070102c, 0x80000f01, 0xe0701030, 0x80001001, 0xe0701034, 0x80001101,
     0xe0701038, 0x80001201, 0xe070103c, 0x80001301, 0xbf810000,
 };
+
+alignas(256) constexpr auto ProductCode = [] {
+    std::array<std::uint32_t, LevelZeroCode.size() + 4u> code{};
+    std::copy_n(LevelZeroCode.begin(), 8u, code.begin());
+    for (std::uint32_t component = 0u; component < 4u; ++component) {
+        const auto reg = 8u + component;
+        code[8u + component] = 0x10000000u | (reg << 17u) | (reg << 9u) | 0x100u | reg;
+    }
+    std::copy(LevelZeroCode.begin() + 8u, LevelZeroCode.end(), code.begin() + 12u);
+    return code;
+}();
 
 enum class Offset { None, Lane, Constant };
 constexpr std::int32_t ConstantOffsetU = -3;
@@ -294,6 +306,56 @@ void Check(const Program& program, const SamplerCase& sampler, std::uint32_t lev
     }
 }
 
+void CheckNormalizedProducts(AgcDriver::VulkanDevice& device) {
+    constexpr auto FloatFormat = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format32_32_32_32Float);
+    constexpr auto SignedFormat = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format8_8_8_8SNorm);
+    const std::array<std::uint32_t, 4> texels{0x7f812345u, 0xffc54321u, 0x80000000u, 0x7f800000u};
+    auto texture = TextureDescriptor(SingleLevel.data(), 0u, 0u);
+    texture[1] &= 0x3fffffffu;
+    texture[2] = 0u;
+    const std::array<std::uint32_t, 4> sampler{0x92u, 0u, 0u, 0u};
+    const std::vector<Coordinate> coordinate{{0.5f, 0.5f}};
+    std::vector<std::uint32_t> userData(16u, 0u);
+    const auto buffer = BufferDescriptor(Buffer.data(), static_cast<std::uint32_t>(Buffer.size() * 4u));
+    std::copy(buffer.begin(), buffer.end(), userData.begin());
+    std::copy(sampler.begin(), sampler.end(), userData.begin() + 12u);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(ProductCode.data()), std::as_bytes(std::span(ProductCode))}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(ProductCode.data()), ProductCode, 0u, {}},
+        {32u, 0u, userData, compute, std::nullopt, std::nullopt, memory},
+        device.Target(), {0u, 0u, 0u, 128u}
+    };
+    ShaderRecompiler::RecompileResult first;
+    for (const auto format : {Format8888UNorm, SignedFormat, FloatFormat, Format8888UNorm}) {
+        if (format == FloatFormat) std::memcpy(SingleLevel.data(), texels.data(), sizeof(texels));
+        else {
+            const std::array<std::uint8_t, 4> normalized = format == SignedFormat ? std::array<std::uint8_t, 4>{128u, 255u, 0u, 127u} : std::array<std::uint8_t, 4>{0u, 255u, 128u, 64u};
+            std::memcpy(SingleLevel.data(), normalized.data(), normalized.size());
+        }
+        texture[1] = (texture[1] & ~(0x1ffu << 20u)) | (format << 20u);
+        const auto sampled = Run(device, LevelZero, texture, sampler, coordinate).front();
+        std::copy(texture.begin(), texture.end(), userData.begin() + 4u);
+        Buffer.fill(0u);
+        for (std::uint32_t lane = 0u; lane < Threads; ++lane) {
+            Buffer[lane * Words] = std::bit_cast<std::uint32_t>(0.5f);
+            Buffer[lane * Words + 1u] = std::bit_cast<std::uint32_t>(0.5f);
+        }
+        const auto result = ShaderRecompiler::Recompile(request);
+        device.Dispatch(result, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(ProductCode.data()));
+        device.WaitIdle();
+        for (std::uint32_t component = 0u; component < 4u; ++component) {
+            const auto bits = sampled[component];
+            const auto value = std::bit_cast<float>(bits);
+            const auto expected = (bits & 0x7fffffffu) > 0x7f800000u ? bits : std::bit_cast<std::uint32_t>(value * value);
+            Require(Buffer[ResultWord + component] == expected, "normalized sampled products changed the value or NaN payload");
+        }
+        if (first.spirv.empty()) first = result;
+        else if (format == Format8888UNorm) Require(first.spirv.ContentHash() == result.spirv.ContentHash() && result.cacheHit, "normalized sampled products missed the original cached module after a floating-format transition");
+    }
+    FillTexture(SingleLevel, 1u);
+}
+
 void ExpectFailure(AgcDriver::VulkanDevice& device, const Program& program, const std::array<std::uint32_t, 8>& texture, const std::array<std::uint32_t, 4>& sampler, std::string_view reason, const char* what) {
     const std::vector<Coordinate> one{{0.5f, 0.5f}};
     try {
@@ -313,6 +375,7 @@ int main() {
         if (!device) return VulkanTestSkipped;
         FillTexture(SingleLevel, 1);
         FillTexture(MultiLevel, StorageLevels);
+        CheckNormalizedProducts(*device);
         const auto coordinates = Coordinates(0u);
         const auto levelOneCoordinates = Coordinates(1u);
         const auto single = TextureDescriptor(SingleLevel.data(), 0u, 0u);
